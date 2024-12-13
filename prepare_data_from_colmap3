@@ -1,0 +1,124 @@
+import torch
+import numpy as np
+import os
+from scene.dataset_readers import readColmapSceneInfo  # Adjust the import based on your project structure
+from scipy.interpolate import interp1d
+import numpy as np
+import torch
+
+def resample_points(points, target_size):
+    """
+    Resamples `points` to `target_size` using linear interpolation if upsampling
+    or random sampling if downsampling.
+    """
+    num_points = points.shape[0]
+    print(num_points)
+    if num_points == target_size:
+        return points  # No need to resample
+
+    if num_points < target_size:
+        # Upsample using interpolation
+        original_indices = np.linspace(0, 1, num_points)
+        target_indices = np.linspace(0, 1, target_size)
+        interpolator = interp1d(original_indices, points, axis=0, kind='linear')
+        resampled_points = interpolator(target_indices)
+    else:
+        # Downsample using random sampling
+        indices = np.random.choice(num_points, target_size, replace=False)
+        resampled_points = points[indices]
+
+    return resampled_points.astype(np.float32)
+
+def prepare_data_from_colmap(colmap_path, checkpoint_path, save_path="data/train_data.pt"):
+    """
+    Load data from COLMAP output using readColmapSceneInfo and prepare it as training data
+    with 3D positions matched to the size of `pcd_points`.
+    """
+    # Load the checkpoint and extract positions
+    checkpoint = torch.load(checkpoint_path)
+    if not isinstance(checkpoint, tuple) or len(checkpoint) != 2:
+        raise ValueError("Checkpoint should be a tuple: (model_state, iteration).")
+    
+    model_state, _ = checkpoint
+    try:
+        (active_sh_degree, _xyz, *_rest) = model_state
+    except ValueError:
+        raise ValueError("Unexpected format of `model_state` in checkpoint.")
+
+    # Convert `_xyz` to numpy and detach from the computation graph
+    if not isinstance(_xyz, torch.Tensor):
+        raise TypeError("`_xyz` must be a torch.Tensor.")
+    gt_final_positions = _xyz.detach().cpu().numpy().astype(np.float32)  # Shape: (num_points, 3)
+
+    # Use readColmapSceneInfo to load the scene information from COLMAP files
+    scene_info = readColmapSceneInfo(
+        path=colmap_path,
+        images=None,
+        depths="",
+        eval=False,
+        train_test_exp=True
+    )
+    if not hasattr(scene_info, 'point_cloud') or not hasattr(scene_info.point_cloud, 'points'):
+        raise AttributeError("`scene_info` does not have the required `point_cloud.points` attribute.")
+
+    # Extract only the 3D positions from the point cloud
+    pcd_points = scene_info.point_cloud.points  # Shape: (num_points, 3)
+    target_size = pcd_points.shape[0]  # Match the target size to the size of `pcd_points`
+
+    # Trim or upsample `gt_final_positions` to match the size of `pcd_points`
+    if gt_final_positions.shape[0] > target_size:
+        # Downsample gt_final_positions
+        indices = np.random.choice(gt_final_positions.shape[0], target_size, replace=False)
+        labels = gt_final_positions[indices]
+    elif gt_final_positions.shape[0] < target_size:
+        # Upsample gt_final_positions
+        labels = cubic_upsample(gt_final_positions, target_size=target_size)
+    else:
+        # No resampling needed
+        labels = gt_final_positions
+
+    # Inputs remain the same as pcd_points
+    inputs = pcd_points.astype(np.float32)
+
+    # Save as a PyTorch tensor dictionary
+    data = {
+        'inputs': torch.tensor(inputs),
+        'labels': torch.tensor(labels)
+    }
+    torch.save(data, save_path)
+    print(f"Data saved to {save_path} with {target_size} points.")
+
+
+
+
+
+def process_all_scenes(eval_dir, colmap_dir, output_dir):
+    """
+    Process all scenes by matching COLMAP paths and checkpoint files.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    scenes = os.listdir(eval_dir)
+    for scene in scenes:
+        colmap_path = os.path.join(colmap_dir, scene)
+        checkpoint_path = os.path.join(eval_dir, scene, "chkpnt30000.pth")
+        save_path = os.path.join(output_dir, f"{scene}_train_data.pt")
+
+        if not os.path.exists(colmap_path):
+            print(f"COLMAP path not found: {colmap_path}")
+            continue
+        if not os.path.exists(checkpoint_path):
+            print(f"Checkpoint not found: {checkpoint_path}")
+            continue
+
+        print(f"Processing scene: {scene}")
+        prepare_data_from_colmap(colmap_path, checkpoint_path, save_path)
+
+# Example usage
+if __name__ == "__main__":
+    eval_dir = "/root/autodl-tmp/gaussian-splatting/eval"  # Folder containing checkpoints
+    colmap_dir = "/root/autodl-tmp/gaussian-splatting2/colmapall"  # Folder containing COLMAP paths
+    output_dir = "processed_data_upsample"  # Folder to save processed data
+
+    process_all_scenes(eval_dir, colmap_dir, output_dir)
